@@ -39,7 +39,5 @@ Download binary from Github [releases page](https://github.com/cozystack/cozypkg
 
 Or use simple script to install it:
 ```bash
-curl -sSL https://github.com/cozystack/cozypkg/raw/refs/heads/main/hack/install.sh | bash -s
+curl -sSL https://github.com/cozystack/cozypkg/raw/refs/heads/main/hack/install.sh | sh -s
 ```
-
-
