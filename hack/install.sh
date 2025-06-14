@@ -13,22 +13,28 @@ VERSION="latest"
 
 usage() {
   cat <<EOF
-Usage: $0 [-v VERSION]
+Usage: $0 [OPTIONS]
 
 Options:
-  -v VERSION  Install a specific release tag (e.g. 1.3.0 or v1.3.0). Defaults to latest.
-  -h          Show this help message and exit.
+  -v, --version VERSION   Install specific release (e.g. 1.4.0 or v1.4.0).
+  -h, --help              Show this help and exit.
 EOF
 }
 
-while getopts "v:h" opt; do
-  case $opt in
-    v) VERSION="$OPTARG" ;;
-    h) usage; exit 0 ;;
-    *) usage; exit 1 ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v|--version)
+      [ -n "$2" ] || { error "--version requires an argument"; }
+      VERSION="$2"; shift 2 ;;
+    --version=*)
+      VERSION="${1#*=}"; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    --) shift; break ;;
+    *)
+      error "Unknown option: $1" ;;
   esac
 done
-shift $((OPTIND-1))
 
 # Normalize tag: prepend 'v' if user omitted it
 if [ "$VERSION" != "latest" ]; then
@@ -63,9 +69,7 @@ case "$ARCH" in
   x86_64|amd64) ARCH="amd64" ;;
   arm64|aarch64) ARCH="arm64" ;;
   i386|i686) ARCH="i386" ;;
-  *)
-    error "Unsupported architecture: $ARCH"
-    ;;
+  *) error "Unsupported architecture: $ARCH" ;;
 esac
 
 TAR_FILE="cozypkg-$OS-$ARCH.tar.gz"
