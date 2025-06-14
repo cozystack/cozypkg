@@ -4,6 +4,9 @@ Cozy wrapper around Helm and Flux CD for local development
 
 ## Usage
 
+**cozypkg** assumes that you run it from the local directory that contains your Helm chart.  
+All relative paths and operations are resolved against this working directory.
+
 ```
 Cozy wrapper around Helm and Flux CD for local development
 
