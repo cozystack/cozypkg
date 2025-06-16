@@ -84,6 +84,14 @@ func main() {
 		Use:     "cozypkg",
 		Short:   "Cozy wrapper around Helm and Flux CD for local development",
 		Version: Version,
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			if chDir != "" {
+				err := os.Chdir(chDir)
+				if err != nil {
+					log.Fatalf("could not chdir to %s: %v", chDir, err)
+				}
+			}
+		},
 	}
 	root.SetVersionTemplate("cozypkg version {{.Version}}\n")
 
@@ -92,13 +100,6 @@ func main() {
 	root.PersistentFlags().StringVarP(&chDir, "working-directory", "C", "", "Root directory of Helm chart to run against (defaults to current directory)")
 
 	_ = root.RegisterFlagCompletionFunc("namespace", completeNamespaces)
-
-	if chDir != "" {
-		err := os.Chdir(chDir)
-		if err != nil {
-			log.Fatalf("could not chdir to %s: %v", chDir, err)
-		}
-	}
 
 	root.AddCommand(
 		cmdShow(),
