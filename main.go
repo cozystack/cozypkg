@@ -14,6 +14,7 @@ import (
 	"time"
 
 	// Kubernetes auth plugins (Azure, GCP, OIDC, ...).
+
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,7 +43,7 @@ import (
 	"github.com/databus23/helm-diff/v3/diff"
 	"github.com/databus23/helm-diff/v3/manifest"
 
-	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	sigsyaml "sigs.k8s.io/yaml"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -56,14 +57,14 @@ import (
 	hchart "helm.sh/helm/v3/pkg/chartutil"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Global CLI flags.
 var Version = "dev"
 
 var (
-	kubeCfgPath string
+	kubeconfig  string
+	kubecontext string
 	ns          string
 	chDir       string
 	plain       bool     // render without talking to the API server
@@ -95,7 +96,8 @@ func main() {
 	}
 	root.SetVersionTemplate("cozypkg version {{.Version}}\n")
 
-	root.PersistentFlags().StringVar(&kubeCfgPath, "kubeconfig", "", "Path to kubeconfig")
+	root.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig")
+	root.PersistentFlags().StringVar(&kubecontext, "context", "", "Kube context")
 	root.PersistentFlags().StringVarP(&ns, "namespace", "n", "", "Kubernetes namespace (defaults to the current context)")
 	root.PersistentFlags().StringVarP(&chDir, "working-directory", "C", "", "Root directory of Helm chart to run against (defaults to current directory)")
 
@@ -129,20 +131,39 @@ func main() {
 	}
 }
 
-// restConfig builds a *rest.Config from the --kubeconfig flag or $KUBECONFIG.
-func restConfig() (*rest.Config, error) {
-	cfg := kubeCfgPath
-	if cfg == "" {
-		cfg = os.Getenv("KUBECONFIG")
+// loadClientConfig builds a client config with optional kubeconfig and context overrides.
+func loadClientConfig() clientcmd.ClientConfig {
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	if kubeconfig != "" {
+		rules.ExplicitPath = kubeconfig
 	}
-	return clientcmd.BuildConfigFromFlags("", cfg)
+
+	overrides := &clientcmd.ConfigOverrides{}
+	if kubecontext != "" {
+		overrides.CurrentContext = kubecontext
+	}
+	if ns != "" {
+		overrides.Context.Namespace = ns
+	}
+
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides)
+}
+
+// restConfig builds a *rest.Config from the --kubeconfig flag or $KUBECONFIG.
+func restConfig() *rest.Config {
+	config, err := loadClientConfig().ClientConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading kubeconfig: %v\n", err)
+		os.Exit(1)
+	}
+	return config
 }
 
 // helmCfg returns an initialised Helm configuration bound to a namespace.
 func helmCfg(rc *rest.Config, namespace string) (*helmaction.Configuration, *helmcfg.EnvSettings, error) {
 	env := helmcfg.New()
-	if kubeCfgPath != "" {
-		env.KubeConfig = kubeCfgPath
+	if kubeconfig != "" {
+		env.KubeConfig = kubeconfig
 	}
 	env.SetNamespace(namespace)
 
@@ -334,10 +355,7 @@ func realHelmDiff(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir st
 	inst.DisableHooks = true
 	inst.PostRenderer = &fluxPostRenderer{name: hr.Name, ns: hr.Namespace}
 
-	rc, err := restConfig()
-	if err != nil {
-		return "", err
-	}
+	rc := restConfig()
 	kubeVer, err := discoverKubeVersion(rc)
 	if err != nil {
 		return "", err
@@ -382,23 +400,20 @@ func cmdFactory(name string, fn runFn) *cobra.Command {
 				}
 			}
 
+			var err error
+			rc := restConfig()
+
 			// Offline mode: create a minimal stub.
 			if plain {
 				if ns == "" {
 					ns = "default"
 				}
 				stub := &v2.HelmRelease{ObjectMeta: metav1.ObjectMeta{Name: relName, Namespace: ns}}
-				rc, _ := restConfig()
 				cfg, _, err := helmCfg(rc, ns)
 				if err != nil {
 					return err
 				}
 				return fn(cfg, stub, ".")
-			}
-
-			rc, err := restConfig()
-			if err != nil {
-				return err
 			}
 
 			if ns == "" {
@@ -413,13 +428,13 @@ func cmdFactory(name string, fn runFn) *cobra.Command {
 				return err
 			}
 
-			cl, err := ctrlclient.New(rc, ctrlclient.Options{})
+			cl, err := client.New(rc, client.Options{})
 			if err != nil {
 				return err
 			}
 
 			var hr v2.HelmRelease
-			if err := cl.Get(context.TODO(), ctrlclient.ObjectKey{Namespace: ns, Name: relName}, &hr); err != nil {
+			if err := cl.Get(context.TODO(), client.ObjectKey{Namespace: ns, Name: relName}, &hr); err != nil {
 				return err
 			}
 
@@ -450,7 +465,9 @@ func cmdShow() *cobra.Command {
 			return err
 		}
 
-		rc, _ := restConfig()
+		var err error
+		rc := restConfig()
+
 		mani, err := renderManifests(cfg, hr, chartDir, vals, rc)
 		if err != nil {
 			return err
@@ -505,8 +522,11 @@ func cmdApply() *cobra.Command {
 		}
 		ctx := context.Background()
 
-		rc, _ := restConfig()
-		cl, _ := ctrlclient.New(rc, ctrlclient.Options{})
+		rc := restConfig()
+		cl, err := client.New(rc, client.Options{})
+		if err != nil {
+			return fmt.Errorf("could not create Kubernetes client: %w", err)
+		}
 
 		bc := record.NewBroadcaster()
 		defer bc.Shutdown()
@@ -606,8 +626,11 @@ func cmdDiff() *cobra.Command {
 // cmdSuspend returns the `cozypkg suspend` command.
 func cmdSuspend() *cobra.Command {
 	cmd := cmdFactory("suspend", func(_ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
-		rc, _ := restConfig()
-		cl, _ := ctrlclient.New(rc, ctrlclient.Options{})
+		rc := restConfig()
+		cl, err := client.New(rc, client.Options{})
+		if err != nil {
+			return fmt.Errorf("could not create Kubernetes client: %w", err)
+		}
 		return patchSuspend(context.Background(), cl, hr.Namespace, hr.Name, pointer.Bool(true))
 	})
 	cmd.Short = "Suspend Flux HelmRelease"
@@ -617,8 +640,11 @@ func cmdSuspend() *cobra.Command {
 // cmdResume returns the `cozypkg resume` command.
 func cmdResume() *cobra.Command {
 	cmd := cmdFactory("resume", func(_ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
-		rc, _ := restConfig()
-		cl, _ := ctrlclient.New(rc, ctrlclient.Options{})
+		rc := restConfig()
+		cl, err := client.New(rc, client.Options{})
+		if err != nil {
+			return fmt.Errorf("could not create Kubernetes client: %w", err)
+		}
 		return patchSuspend(context.Background(), cl, hr.Namespace, hr.Name, nil)
 	})
 	cmd.Short = "Resume Flux HelmRelease"
@@ -638,13 +664,7 @@ func cmdDelete() *cobra.Command {
 
 // defaultNamespace returns the namespace from the kubeconfig or "default".
 func defaultNamespace() (string, bool, error) {
-	cfg := kubeCfgPath
-	if cfg == "" {
-		cfg = os.Getenv("KUBECONFIG")
-	}
-	loading := &clientcmd.ClientConfigLoadingRules{ExplicitPath: cfg}
-	cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loading, &clientcmd.ConfigOverrides{})
-	return cc.Namespace()
+	return loadClientConfig().Namespace()
 }
 
 // serverTable retrieves a metav1.Table from the API server.
@@ -722,10 +742,8 @@ func runHRCommand(cmd *cobra.Command, args []string, allNS bool, output *string)
 		return fmt.Errorf("-A/--all-namespaces may be used only when no names are specified")
 	}
 
-	rc, err := restConfig()
-	if err != nil {
-		return err
-	}
+	var err error
+	rc := restConfig()
 
 	nsLocal := ns
 	if nsLocal == "" && !allNS {
@@ -927,7 +945,7 @@ func newHistoryEntry(hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Sna
 }
 
 // markSuccess sets Ready=True and emits a normal event.
-func markSuccess(ctx context.Context, cl ctrlclient.Client, rec record.EventRecorder, hr *v2.HelmRelease, chartVer, cfgDigest string) {
+func markSuccess(ctx context.Context, cl client.Client, rec record.EventRecorder, hr *v2.HelmRelease, chartVer, cfgDigest string) {
 	msg := fmt.Sprintf("Helm upgrade succeeded for %s/%s with chart %s@%s", hr.Namespace, hr.Name, hr.Spec.Chart.Spec.Chart, chartVer)
 
 	conditions.MarkTrue(hr, v2.ReleasedCondition, v2.UpgradeSucceededReason, msg)
@@ -943,7 +961,7 @@ func markSuccess(ctx context.Context, cl ctrlclient.Client, rec record.EventReco
 }
 
 // markFailure sets Ready=False and emits a warning event.
-func markFailure(ctx context.Context, cl ctrlclient.Client, rec record.EventRecorder, hr *v2.HelmRelease, err error) {
+func markFailure(ctx context.Context, cl client.Client, rec record.EventRecorder, hr *v2.HelmRelease, err error) {
 	msg := fmt.Sprintf("Helm upgrade failed for %s/%s: %s", hr.Namespace, hr.Name, err.Error())
 
 	conditions.MarkFalse(hr, v2.ReleasedCondition, v2.UpgradeFailedReason, err.Error())
@@ -958,7 +976,7 @@ func markFailure(ctx context.Context, cl ctrlclient.Client, rec record.EventReco
 }
 
 // patchSuspend toggles spec.suspend using a merge-patch with a Flux field owner.
-func patchSuspend(ctx context.Context, cl ctrlclient.Client, ns, name string, val *bool) error {
+func patchSuspend(ctx context.Context, cl client.Client, ns, name string, val *bool) error {
 	var payload []byte
 	switch {
 	case val == nil:
@@ -1040,11 +1058,10 @@ func cmdCompletion() *cobra.Command {
 }
 
 func completeNamespaces(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	rc, err := restConfig()
-	if err != nil {
-		return nil, cobra.ShellCompDirectiveError
-	}
-	cl, err := ctrlclient.New(rc, ctrlclient.Options{})
+	var err error
+	rc := restConfig()
+
+	cl, err := client.New(rc, client.Options{})
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
@@ -1064,11 +1081,13 @@ func completeNamespaces(cmd *cobra.Command, args []string, toComplete string) ([
 }
 
 func completeHelmReleases(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	rc, err := restConfig()
+	var err error
+	rc := restConfig()
+
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
-	cl, err := ctrlclient.New(rc, ctrlclient.Options{})
+	cl, err := client.New(rc, client.Options{})
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
@@ -1109,11 +1128,10 @@ func cmdReconcile() *cobra.Command {
 		// ------------------------------------------------------------------ //
 		// Clients & helpers                                                  //
 		// ------------------------------------------------------------------ //
-		rc, err := restConfig()
-		if err != nil {
-			return err
-		}
-		cl, err := ctrlclient.New(rc, ctrlclient.Options{})
+		var err error
+		rc := restConfig()
+
+		cl, err := client.New(rc, client.Options{})
 		if err != nil {
 			return err
 		}
@@ -1216,7 +1234,7 @@ func cmdReconcile() *cobra.Command {
 		patch := map[string]interface{}{"metadata": map[string]interface{}{"annotations": ann}}
 		pbytes, _ := json.Marshal(patch)
 		if err := cl.Patch(ctx, hr,
-			ctrlclient.RawPatch(types.MergePatchType, pbytes)); err != nil {
+			client.RawPatch(types.MergePatchType, pbytes)); err != nil {
 			return fmt.Errorf("patch HelmRelease: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, "✔ HelmRelease %s annotated\n", hr.Name)
