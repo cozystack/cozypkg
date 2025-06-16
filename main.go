@@ -65,6 +65,7 @@ var Version = "dev"
 var (
 	kubeCfgPath string
 	ns          string
+	chDir       string
 	plain       bool     // render without talking to the API server
 	showOnly    []string // template globs for `cozypkg show`
 	extraVals   []string // additional -f/--values files
@@ -88,8 +89,16 @@ func main() {
 
 	root.PersistentFlags().StringVar(&kubeCfgPath, "kubeconfig", "", "Path to kubeconfig")
 	root.PersistentFlags().StringVarP(&ns, "namespace", "n", "", "Kubernetes namespace (defaults to the current context)")
+	root.PersistentFlags().StringVarP(&chDir, "working-directory", "C", "", "Root directory of Helm chart to run against (defaults to current directory)")
 
 	_ = root.RegisterFlagCompletionFunc("namespace", completeNamespaces)
+
+	if chDir != "" {
+		err := os.Chdir(chDir)
+		if err != nil {
+			log.Fatalf("could not chdir to %s: %v", chDir, err)
+		}
+	}
 
 	root.AddCommand(
 		cmdShow(),
