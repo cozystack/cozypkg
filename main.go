@@ -131,11 +131,10 @@ func main() {
 
 // restConfig builds a *rest.Config from the --kubeconfig flag or $KUBECONFIG.
 func restConfig() (*rest.Config, error) {
-	cfg := kubeCfgPath
-	if cfg == "" {
-		cfg = os.Getenv("KUBECONFIG")
+	if path := resolvedKubeconfigPath(); path != "" {
+		return clientcmd.BuildConfigFromFlags("", path)
 	}
-	return clientcmd.BuildConfigFromFlags("", cfg)
+	return rest.InClusterConfig()
 }
 
 // helmCfg returns an initialised Helm configuration bound to a namespace.
@@ -638,13 +637,25 @@ func cmdDelete() *cobra.Command {
 
 // defaultNamespace returns the namespace from the kubeconfig or "default".
 func defaultNamespace() (string, bool, error) {
-	cfg := kubeCfgPath
-	if cfg == "" {
-		cfg = os.Getenv("KUBECONFIG")
+	path := resolvedKubeconfigPath()
+	if path != "" {
+		loading := &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
+		cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loading, &clientcmd.ConfigOverrides{})
+		ns, overridden, err := cc.Namespace()
+		if err != nil {
+			return "default", false, nil
+		}
+		return ns, overridden, nil
 	}
-	loading := &clientcmd.ClientConfigLoadingRules{ExplicitPath: cfg}
-	cc := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loading, &clientcmd.ConfigOverrides{})
-	return cc.Namespace()
+
+	// Try reading namespace from in-cluster location
+	data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err == nil {
+		return strings.TrimSpace(string(data)), false, nil
+	}
+
+	// Fallback
+	return "default", false, nil
 }
 
 // serverTable retrieves a metav1.Table from the API server.
@@ -1262,4 +1273,22 @@ func discoverKubeVersion(rc *rest.Config) (hchart.KubeVersion, error) {
 		Major:   info.Major,
 		Minor:   info.Minor,
 	}, nil
+}
+
+func resolvedKubeconfigPath() string {
+	if kubeCfgPath != "" {
+		return kubeCfgPath
+	}
+	if env := os.Getenv("KUBECONFIG"); env != "" {
+		return env
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	cfg := filepath.Join(home, ".kube", "config")
+	if _, err := os.Stat(cfg); err == nil {
+		return cfg
+	}
+	return ""
 }
