@@ -248,6 +248,11 @@ func renderManifests(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir
 	inst.DisableHooks = true
 
 	if plain {
+		kubeVer, err := discoverKubeVersion(rc)
+		if err != nil {
+			return "", err
+		}
+		inst.KubeVersion = &kubeVer
 		vers, err := discoverAPIVersions(rc)
 		if err != nil {
 			return "", err
@@ -328,6 +333,16 @@ func realHelmDiff(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir st
 	inst.Namespace = hr.Namespace
 	inst.DisableHooks = true
 	inst.PostRenderer = &fluxPostRenderer{name: hr.Name, ns: hr.Namespace}
+
+	rc, err := restConfig()
+	if err != nil {
+		return "", err
+	}
+	kubeVer, err := discoverKubeVersion(rc)
+	if err != nil {
+		return "", err
+	}
+	inst.KubeVersion = &kubeVer
 
 	ch, err := loader.Load(chartDir)
 	if err != nil {
@@ -1228,4 +1243,23 @@ func cmdReconcile() *cobra.Command {
 	cmd.Flags().BoolVar(&force, "force", false,
 		"Force a one-off upgrade of the HelmRelease")
 	return cmd
+}
+
+func discoverKubeVersion(rc *rest.Config) (hchart.KubeVersion, error) {
+	if rc == nil {
+		return hchart.KubeVersion{}, fmt.Errorf("renderManifests: kubeconfig not found – cannot discover cluster version")
+	}
+	dc, err := discovery.NewDiscoveryClientForConfig(rc)
+	if err != nil {
+		return hchart.KubeVersion{}, err
+	}
+	info, err := dc.ServerVersion()
+	if err != nil {
+		return hchart.KubeVersion{}, err
+	}
+	return hchart.KubeVersion{
+		Version: info.GitVersion,
+		Major:   info.Major,
+		Minor:   info.Minor,
+	}, nil
 }
