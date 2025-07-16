@@ -353,7 +353,6 @@ func realHelmDiff(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir st
 	inst.ReleaseName = hr.Name
 	inst.Namespace = hr.Namespace
 	inst.DisableHooks = true
-	inst.PostRenderer = &fluxPostRenderer{name: hr.Name, ns: hr.Namespace}
 
 	rc := restConfig()
 	kubeVer, err := discoverKubeVersion(rc)
@@ -361,6 +360,13 @@ func realHelmDiff(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir st
 		return "", err
 	}
 	inst.KubeVersion = &kubeVer
+	vers, err := discoverAPIVersions(rc)
+	if err != nil {
+		return "", err
+	}
+	inst.APIVersions = vers
+	inst.ClientOnly = true
+	inst.PostRenderer = &fluxPostRenderer{name: hr.Name, ns: hr.Namespace}
 
 	ch, err := loader.Load(chartDir)
 	if err != nil {
@@ -375,7 +381,7 @@ func realHelmDiff(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir st
 	curSpecs := manifest.Parse(string(current), hr.Namespace, false, manifest.Helm3TestHook, manifest.Helm2TestSuccessHook)
 	newSpecs := manifest.Parse(string(desired), hr.Namespace, false, manifest.Helm3TestHook, manifest.Helm2TestSuccessHook)
 
-	_ = diff.Manifests(curSpecs, newSpecs, &diff.Options{OutputContext: -1}, &buf)
+	_ = diff.Manifests(curSpecs, newSpecs, &diff.Options{OutputContext: -1, ShowSecrets: true}, &buf)
 	return buf.String(), nil
 }
 
