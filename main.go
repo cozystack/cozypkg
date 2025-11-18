@@ -229,20 +229,22 @@ func ensureMap(parent map[string]interface{}, key string) map[string]interface{}
 func mergedValues(hr *v2.HelmRelease, chartDir string) (map[string]interface{}, error) {
 	vals := map[string]interface{}{}
 
-	for _, vf := range hr.Spec.Chart.Spec.ValuesFiles {
-		if vf == "-" { // stdin placeholder – not applicable here
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(chartDir, vf))
-		if err != nil {
-			return nil, err
-		}
-		var mv map[string]interface{}
-		if err := sigsyaml.Unmarshal(data, &mv); err != nil {
-			return nil, err
-		}
-		if err := mergo.Merge(&vals, mv, mergo.WithOverride); err != nil {
-			return nil, err
+	if hr.Spec.Chart != nil {
+		for _, vf := range hr.Spec.Chart.Spec.ValuesFiles {
+			if vf == "-" { // stdin placeholder – not applicable here
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(chartDir, vf))
+			if err != nil {
+				return nil, err
+			}
+			var mv map[string]interface{}
+			if err := sigsyaml.Unmarshal(data, &mv); err != nil {
+				return nil, err
+			}
+			if err := mergo.Merge(&vals, mv, mergo.WithOverride); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -564,8 +566,10 @@ func cmdApply() *cobra.Command {
 
 		var chartVer, cfgDigest string
 		if !plain {
-			cfgDigest := fluxchartutil.DigestValues(digest.Canonical, vals).String()
-			chartVer := hr.Spec.Chart.Spec.Version
+			cfgDigest = fluxchartutil.DigestValues(digest.Canonical, vals).String()
+			if hr.Spec.Chart != nil {
+				chartVer = hr.Spec.Chart.Spec.Version
+			}
 
 			hr.Status.LastAttemptedGeneration = hr.Generation
 			hr.Status.LastAttemptedRevision = chartVer
@@ -941,11 +945,15 @@ func cmdList() *cobra.Command {
 
 // newHistoryEntry creates a v2.Snapshot for status.history.
 func newHistoryEntry(hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Snapshot {
+	chartName := ""
+	if hr.Spec.Chart != nil {
+		chartName = hr.Spec.Chart.Spec.Chart
+	}
 	return &v2.Snapshot{
-		Name:          hr.Spec.Chart.Spec.Chart,
+		Name:          chartName,
 		Namespace:     hr.Namespace,
 		Version:       1,
-		ChartName:     hr.Spec.Chart.Spec.Chart,
+		ChartName:     chartName,
 		ChartVersion:  chartVersion,
 		ConfigDigest:  cfgDigest,
 		FirstDeployed: metav1.Now(),
@@ -956,7 +964,11 @@ func newHistoryEntry(hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Sna
 
 // markSuccess sets Ready=True and emits a normal event.
 func markSuccess(ctx context.Context, cl client.Client, rec record.EventRecorder, hr *v2.HelmRelease, chartVer, cfgDigest string) {
-	msg := fmt.Sprintf("Helm upgrade succeeded for %s/%s with chart %s@%s", hr.Namespace, hr.Name, hr.Spec.Chart.Spec.Chart, chartVer)
+	chartName := ""
+	if hr.Spec.Chart != nil {
+		chartName = hr.Spec.Chart.Spec.Chart
+	}
+	msg := fmt.Sprintf("Helm upgrade succeeded for %s/%s with chart %s@%s", hr.Namespace, hr.Name, chartName, chartVer)
 
 	conditions.MarkTrue(hr, v2.ReleasedCondition, v2.UpgradeSucceededReason, msg)
 	conditions.MarkTrue(hr, fluxmeta.ReadyCondition, v2.UpgradeSucceededReason, msg)
@@ -1192,6 +1204,9 @@ func cmdReconcile() *cobra.Command {
 		// 1. (optional) HelmChart                                            //
 		// ------------------------------------------------------------------ //
 		if withSource {
+			if hr.Spec.Chart == nil {
+				return fmt.Errorf("HelmRelease %s/%s has no chart spec", hr.Namespace, hr.Name)
+			}
 			chartNS := hr.Spec.Chart.Spec.SourceRef.Namespace
 			if chartNS == "" {
 				chartNS = hr.Namespace
