@@ -296,7 +296,7 @@ func renderManifests(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir
 }
 
 // upgradeRelease runs a Helm upgrade (installing if necessary).
-func upgradeRelease(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string, vals map[string]interface{}) error {
+func upgradeRelease(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string, vals map[string]interface{}, takeOwnership bool) error {
 	relName := hr.Name
 	namespace := hr.Namespace
 
@@ -315,6 +315,7 @@ func upgradeRelease(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir 
 		inst := helmaction.NewInstall(cfg)
 		inst.Namespace = namespace
 		inst.ReleaseName = relName
+		inst.TakeOwnership = takeOwnership
 		if !plain {
 			inst.PostRenderer = &fluxPostRenderer{name: relName, ns: namespace}
 		}
@@ -325,6 +326,7 @@ func upgradeRelease(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir 
 	up := helmaction.NewUpgrade(cfg)
 	up.Namespace = namespace
 	up.Install = true // informative only
+	up.TakeOwnership = takeOwnership
 	if !plain {
 		up.PostRenderer = &fluxPostRenderer{name: relName, ns: namespace}
 	}
@@ -522,6 +524,7 @@ func cmdShow() *cobra.Command {
 // cmdApply returns the `cozypkg apply` command.
 func cmdApply() *cobra.Command {
 	var autoResume bool
+	var takeOwnership bool
 	cmd := cmdFactory("apply", func(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
 		if plain && autoResume {
 			return fmt.Errorf("--resume may not be used with --plain")
@@ -571,7 +574,7 @@ func cmdApply() *cobra.Command {
 			_ = cl.Status().Update(ctx, hr)
 		}
 
-		if err := upgradeRelease(cfg, hr, chartDir, vals); err != nil {
+		if err := upgradeRelease(cfg, hr, chartDir, vals, takeOwnership); err != nil {
 			markFailure(ctx, cl, nil, hr, err)
 			return err
 		}
@@ -592,6 +595,7 @@ func cmdApply() *cobra.Command {
 	cmd.Flags().BoolVar(&plain, "plain", false, "Install chart without querying values from the HelmRelease")
 	cmd.Flags().BoolVar(&autoResume, "resume", false, "Automatically clear spec.suspend after successful apply")
 	cmd.Flags().StringSliceVarP(&extraVals, "values", "f", nil, "Additional values files (may be repeated)")
+	cmd.Flags().BoolVar(&takeOwnership, "take-ownership", false, "Take ownership of existing resources")
 	return cmd
 }
 
