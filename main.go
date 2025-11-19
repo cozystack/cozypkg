@@ -245,6 +245,7 @@ func resolveChartRef(ctx context.Context, cl client.Client, hr *v2.HelmRelease) 
 	switch refKind {
 	case "ExternalArtifact":
 		// ExternalArtifact - fetch the resource to extract chart name from artifact path
+		// Note: For valuesFiles, we now use annotation, so this is mainly for chartName/chartVersion
 		extArtifactGVR := schema.GroupVersionResource{
 			Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "externalartifacts",
 		}
@@ -255,6 +256,8 @@ func resolveChartRef(ctx context.Context, cl client.Client, hr *v2.HelmRelease) 
 			Kind:    "ExternalArtifact",
 		})
 		if err := cl.Get(ctx, types.NamespacedName{Namespace: refNS, Name: refName}, extArtifact); err != nil {
+			// If ExternalArtifact is not found, return error - caller should handle this gracefully
+			// For valuesFiles, we use annotation instead, so this is mainly for chartName
 			return "", "", nil, fmt.Errorf("failed to get ExternalArtifact %s/%s: %w", refNS, refName, err)
 		}
 
@@ -271,6 +274,7 @@ func resolveChartRef(ctx context.Context, cl client.Client, hr *v2.HelmRelease) 
 			return "", "", nil, fmt.Errorf("ExternalArtifact %s/%s has unexpected artifact path format: %s", refNS, refName, artifactPath)
 		}
 		chartName = parts[2]
+		// ExternalArtifact doesn't provide valuesFiles - we use annotation instead
 		return chartName, "", nil, nil
 
 	case "HelmChart":
@@ -351,21 +355,32 @@ func findArtifactGeneratorForExternalArtifact(ctx context.Context, cl client.Cli
 	return nil, fmt.Errorf("ArtifactGenerator for ExternalArtifact %s/%s not found", extArtifactNS, extArtifactName)
 }
 
-// getChartInfo gets chart name and version from chart or chartRef.
-func getChartInfo(ctx context.Context, cl client.Client, hr *v2.HelmRelease) (chartName, chartVersion string, err error) {
-	if hr.Spec.ChartRef != nil {
-		name, version, _, err := resolveChartRef(ctx, cl, hr)
-		if err != nil {
-			return "", "", err
-		}
-		return name, version, nil
+// getChartInfo gets chart name and version from local chart's Chart.yaml.
+func getChartInfo(chartDir string) (chartName, chartVersion string, err error) {
+	if chartDir == "" {
+		return "", "", fmt.Errorf("chartDir is empty")
 	}
 
-	if hr.Spec.Chart != nil {
-		return hr.Spec.Chart.Spec.Chart, hr.Spec.Chart.Spec.Version, nil
+	chartYamlPath := filepath.Join(chartDir, "Chart.yaml")
+	data, err := os.ReadFile(chartYamlPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read Chart.yaml from %s: %w", chartDir, err)
 	}
 
-	return "", "", fmt.Errorf("neither chart nor chartRef is set")
+	// Parse Chart.yaml
+	var chartMeta struct {
+		Name    string `yaml:"name"`
+		Version string `yaml:"version"`
+	}
+	if err := sigsyaml.Unmarshal(data, &chartMeta); err != nil {
+		return "", "", fmt.Errorf("failed to parse Chart.yaml: %w", err)
+	}
+
+	if chartMeta.Name == "" {
+		return "", "", fmt.Errorf("chart name is empty in Chart.yaml")
+	}
+
+	return chartMeta.Name, chartMeta.Version, nil
 }
 
 // mergedValues merges valuesFiles and inline .spec.values in the given HelmRelease.
@@ -374,14 +389,22 @@ func mergedValues(ctx context.Context, cl client.Client, hr *v2.HelmRelease, cha
 
 	var valuesFiles []string
 
-	// Get valuesFiles from chart or chartRef
-	if hr.Spec.ChartRef != nil {
-		_, _, vf, err := resolveChartRef(ctx, cl, hr)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve chartRef: %w", err)
+	// First, try to get valuesFiles from annotation (set by operator)
+	if ann := hr.GetAnnotations(); ann != nil {
+		if vfStr, ok := ann["cozypkg.cozystack.io/values-files"]; ok {
+			// Format: comma-separated string, e.g., "values.yaml,values-cilium.yaml"
+			if vfStr != "" {
+				valuesFiles = strings.Split(vfStr, ",")
+				// Trim whitespace from each value
+				for i, vf := range valuesFiles {
+					valuesFiles[i] = strings.TrimSpace(vf)
+				}
+			}
 		}
-		valuesFiles = vf
-	} else if hr.Spec.Chart != nil {
+	}
+
+	// Fallback: Get valuesFiles from chart spec if annotation not found
+	if len(valuesFiles) == 0 && hr.Spec.Chart != nil {
 		valuesFiles = hr.Spec.Chart.Spec.ValuesFiles
 	}
 
@@ -723,7 +746,7 @@ func cmdApply() *cobra.Command {
 		var chartVer, cfgDigest string
 		if !plain {
 			cfgDigest = fluxchartutil.DigestValues(digest.Canonical, vals).String()
-			_, ver, err := getChartInfo(ctx, cl, hr)
+			_, ver, err := getChartInfo(chartDir)
 			if err == nil {
 				chartVer = ver
 			}
@@ -747,7 +770,7 @@ func cmdApply() *cobra.Command {
 		}
 
 		if !plain {
-			markSuccess(ctx, cl, rec, hr, chartVer, cfgDigest)
+			markSuccess(ctx, cl, rec, hr, chartVer, cfgDigest, chartDir)
 		}
 		return nil
 	})
@@ -1091,8 +1114,8 @@ func cmdList() *cobra.Command {
 }
 
 // newHistoryEntry creates a v2.Snapshot for status.history.
-func newHistoryEntry(ctx context.Context, cl client.Client, hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Snapshot {
-	chartName, _, err := getChartInfo(ctx, cl, hr)
+func newHistoryEntry(hr *v2.HelmRelease, chartVersion, cfgDigest string, chartDir string) *v2.Snapshot {
+	chartName, _, err := getChartInfo(chartDir)
 	if err != nil {
 		// Log the error and fall back to the HelmRelease name.
 		log.Printf("could not get chart info for %s/%s: %v", hr.Namespace, hr.Name, err)
@@ -1112,8 +1135,8 @@ func newHistoryEntry(ctx context.Context, cl client.Client, hr *v2.HelmRelease, 
 }
 
 // markSuccess sets Ready=True and emits a normal event.
-func markSuccess(ctx context.Context, cl client.Client, rec record.EventRecorder, hr *v2.HelmRelease, chartVer, cfgDigest string) {
-	chartName, _, err := getChartInfo(ctx, cl, hr)
+func markSuccess(ctx context.Context, cl client.Client, rec record.EventRecorder, hr *v2.HelmRelease, chartVer, cfgDigest string, chartDir string) {
+	chartName, _, err := getChartInfo(chartDir)
 	if err != nil {
 		// Log the error and fall back to the HelmRelease name for the message.
 		log.Printf("could not get chart info for %s/%s: %v", hr.Namespace, hr.Name, err)
@@ -1124,7 +1147,7 @@ func markSuccess(ctx context.Context, cl client.Client, rec record.EventRecorder
 	conditions.MarkTrue(hr, v2.ReleasedCondition, v2.UpgradeSucceededReason, msg)
 	conditions.MarkTrue(hr, fluxmeta.ReadyCondition, v2.UpgradeSucceededReason, msg)
 
-	hr.Status.History = append(hr.Status.History, newHistoryEntry(ctx, cl, hr, chartVer, cfgDigest))
+	hr.Status.History = append(hr.Status.History, newHistoryEntry(hr, chartVer, cfgDigest, chartDir))
 	hr.Status.Failures = 0
 	hr.Status.ObservedGeneration = hr.Generation
 	_ = cl.Status().Update(ctx, hr)
