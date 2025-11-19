@@ -32,6 +32,7 @@ import (
 
 	"dario.cat/mergo"
 	v2 "github.com/fluxcd/helm-controller/api/v2"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1"
 	"github.com/opencontainers/go-digest"
 	"github.com/spf13/cobra"
 	clientsetscheme "k8s.io/client-go/kubernetes/scheme"
@@ -74,6 +75,7 @@ var (
 
 func init() {
 	_ = v2.AddToScheme(clientsetscheme.Scheme)
+	_ = sourcev1.AddToScheme(clientsetscheme.Scheme)
 	_ = metav1.AddMetaToScheme(clientsetscheme.Scheme)
 }
 
@@ -225,29 +227,183 @@ func ensureMap(parent map[string]interface{}, key string) map[string]interface{}
 	return m
 }
 
-// mergedValues merges valuesFiles and inline .spec.values in the given HelmRelease.
-func mergedValues(hr *v2.HelmRelease, chartDir string) (map[string]interface{}, error) {
-	vals := map[string]interface{}{}
+// resolveChartRef resolves a chartRef to get chart information (name, version, valuesFiles).
+// Note: chart directory is expected to be available locally, this function only gets metadata.
+func resolveChartRef(ctx context.Context, cl client.Client, hr *v2.HelmRelease) (chartName, chartVersion string, valuesFiles []string, err error) {
+	if hr.Spec.ChartRef == nil {
+		return "", "", nil, fmt.Errorf("chartRef is nil")
+	}
 
-	if hr.Spec.Chart != nil {
-		for _, vf := range hr.Spec.Chart.Spec.ValuesFiles {
-			if vf == "-" { // stdin placeholder – not applicable here
-				continue
+	refNS := hr.Spec.ChartRef.Namespace
+	if refNS == "" {
+		refNS = hr.Namespace
+	}
+
+	refName := hr.Spec.ChartRef.Name
+	refKind := hr.Spec.ChartRef.Kind
+
+	switch refKind {
+	case "ExternalArtifact":
+		// ExternalArtifact - fetch the resource to extract chart name from artifact path
+		extArtifactGVR := schema.GroupVersionResource{
+			Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "externalartifacts",
+		}
+		extArtifact := &unstructured.Unstructured{}
+		extArtifact.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   extArtifactGVR.Group,
+			Version: extArtifactGVR.Version,
+			Kind:    "ExternalArtifact",
+		})
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: refNS, Name: refName}, extArtifact); err != nil {
+			return "", "", nil, fmt.Errorf("failed to get ExternalArtifact %s/%s: %w", refNS, refName, err)
+		}
+
+		// Extract chart name from artifact path: externalartifact/{namespace}/{name}/{revision}.tar.gz
+		// The chart name is the third segment (index 2) in the path
+		artifactPath, found, _ := unstructured.NestedString(extArtifact.Object, "status", "artifact", "path")
+		if !found || artifactPath == "" {
+			return "", "", nil, fmt.Errorf("ExternalArtifact %s/%s does not have artifact path in status", refNS, refName)
+		}
+		parts := strings.Split(artifactPath, "/")
+		// Path format: externalartifact/{namespace}/{name}/{revision}.tar.gz
+		// We want the {name} part (index 2)
+		if len(parts) < 3 {
+			return "", "", nil, fmt.Errorf("ExternalArtifact %s/%s has unexpected artifact path format: %s", refNS, refName, artifactPath)
+		}
+		chartName = parts[2]
+		return chartName, "", nil, nil
+
+	case "HelmChart":
+		chart := &sourcev1.HelmChart{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: refNS, Name: refName}, chart); err != nil {
+			return "", "", nil, fmt.Errorf("failed to get HelmChart %s/%s: %w", refNS, refName, err)
+		}
+
+		chartName = chart.Spec.Chart
+		chartVersion = chart.Spec.Version
+		valuesFiles = chart.Spec.ValuesFiles
+		return chartName, chartVersion, valuesFiles, nil
+
+	case "OCIRepository":
+		oci := &sourcev1.OCIRepository{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: refNS, Name: refName}, oci); err != nil {
+			return "", "", nil, fmt.Errorf("failed to get OCIRepository %s/%s: %w", refNS, refName, err)
+		}
+
+		// Extract chart name from OCI URL or use reference name
+		chartName = refName
+		if oci.Spec.URL != "" {
+			parts := strings.Split(strings.TrimPrefix(oci.Spec.URL, "oci://"), "/")
+			if len(parts) > 0 {
+				chartName = parts[len(parts)-1]
 			}
-			data, err := os.ReadFile(filepath.Join(chartDir, vf))
-			if err != nil {
-				return nil, err
-			}
-			var mv map[string]interface{}
-			if err := sigsyaml.Unmarshal(data, &mv); err != nil {
-				return nil, err
-			}
-			if err := mergo.Merge(&vals, mv, mergo.WithOverride); err != nil {
-				return nil, err
+		}
+
+		return chartName, "", nil, nil
+
+	default:
+		return "", "", nil, fmt.Errorf("unsupported chartRef kind: %s", refKind)
+	}
+}
+
+// findArtifactGeneratorForExternalArtifact finds the ArtifactGenerator that created the given ExternalArtifact
+// by searching through ArtifactGenerators' inventory.
+func findArtifactGeneratorForExternalArtifact(ctx context.Context, cl client.Client, extArtifactNS, extArtifactName string) (*unstructured.Unstructured, error) {
+	dyn, err := dynamic.NewForConfig(restConfig())
+	if err != nil {
+		return nil, err
+	}
+
+	artifactGenGVR := schema.GroupVersionResource{
+		Group: "source.extensions.fluxcd.io", Version: "v1beta1", Resource: "artifactgenerators",
+	}
+
+	list, err := dyn.Resource(artifactGenGVR).Namespace(extArtifactNS).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if !meta.IsNoMatchError(err) {
+			return nil, fmt.Errorf("failed to list ArtifactGenerators with GVR %s: %w", artifactGenGVR, err)
+		}
+		artifactGenGVR = schema.GroupVersionResource{
+			Group: "source.watcher.fluxcd.io", Version: "v2", Resource: "artifactgenerators",
+		}
+		list, err = dyn.Resource(artifactGenGVR).Namespace(extArtifactNS).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list ArtifactGenerators with GVR %s: %w", artifactGenGVR, err)
+		}
+	}
+
+	for _, item := range list.Items {
+		inventory, found, _ := unstructured.NestedSlice(item.Object, "status", "inventory")
+		if found {
+			for _, inv := range inventory {
+				invMap, ok := inv.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name, _, _ := unstructured.NestedString(invMap, "name")
+				if name == extArtifactName {
+					return &item, nil
+				}
 			}
 		}
 	}
 
+	return nil, fmt.Errorf("ArtifactGenerator for ExternalArtifact %s/%s not found", extArtifactNS, extArtifactName)
+}
+
+// getChartInfo gets chart name and version from chart or chartRef.
+func getChartInfo(ctx context.Context, cl client.Client, hr *v2.HelmRelease) (chartName, chartVersion string, err error) {
+	if hr.Spec.ChartRef != nil {
+		name, version, _, err := resolveChartRef(ctx, cl, hr)
+		if err != nil {
+			return "", "", err
+		}
+		return name, version, nil
+	}
+
+	if hr.Spec.Chart != nil {
+		return hr.Spec.Chart.Spec.Chart, hr.Spec.Chart.Spec.Version, nil
+	}
+
+	return "", "", fmt.Errorf("neither chart nor chartRef is set")
+}
+
+// mergedValues merges valuesFiles and inline .spec.values in the given HelmRelease.
+func mergedValues(ctx context.Context, cl client.Client, hr *v2.HelmRelease, chartDir string) (map[string]interface{}, error) {
+	vals := map[string]interface{}{}
+
+	var valuesFiles []string
+
+	// Get valuesFiles from chart or chartRef
+	if hr.Spec.ChartRef != nil {
+		_, _, vf, err := resolveChartRef(ctx, cl, hr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve chartRef: %w", err)
+		}
+		valuesFiles = vf
+	} else if hr.Spec.Chart != nil {
+		valuesFiles = hr.Spec.Chart.Spec.ValuesFiles
+	}
+
+	// Merge valuesFiles
+	for _, vf := range valuesFiles {
+		if vf == "-" { // stdin placeholder – not applicable here
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(chartDir, vf))
+		if err != nil {
+			return nil, err
+		}
+		var mv map[string]interface{}
+		if err := sigsyaml.Unmarshal(data, &mv); err != nil {
+			return nil, err
+		}
+		if err := mergo.Merge(&vals, mv, mergo.WithOverride); err != nil {
+			return nil, err
+		}
+	}
+
+	// Merge inline values
 	if hr.Spec.Values != nil && len(hr.Spec.Values.Raw) > 0 {
 		var mv map[string]interface{}
 		if err := sigsyaml.Unmarshal(hr.Spec.Values.Raw, &mv); err != nil {
@@ -390,7 +546,7 @@ func realHelmDiff(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir st
 }
 
 // runFn is a helper signature passed to cmdFactory.
-type runFn func(*helmaction.Configuration, *v2.HelmRelease, string) error
+type runFn func(context.Context, client.Client, *helmaction.Configuration, *v2.HelmRelease, string) error
 
 // cmdFactory fetches (or stubs) a HelmRelease and invokes runFn.
 func cmdFactory(name string, fn runFn) *cobra.Command {
@@ -413,6 +569,8 @@ func cmdFactory(name string, fn runFn) *cobra.Command {
 			var err error
 			rc := restConfig()
 
+			ctx := context.TODO()
+
 			// Offline mode: create a minimal stub.
 			if plain {
 				if ns == "" {
@@ -423,7 +581,12 @@ func cmdFactory(name string, fn runFn) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				return fn(cfg, stub, ".")
+				// Create a dummy client for plain mode
+				cl, err := client.New(rc, client.Options{})
+				if err != nil {
+					return err
+				}
+				return fn(ctx, cl, cfg, stub, ".")
 			}
 
 			if ns == "" {
@@ -444,11 +607,11 @@ func cmdFactory(name string, fn runFn) *cobra.Command {
 			}
 
 			var hr v2.HelmRelease
-			if err := cl.Get(context.TODO(), client.ObjectKey{Namespace: ns, Name: relName}, &hr); err != nil {
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: relName}, &hr); err != nil {
 				return err
 			}
 
-			return fn(cfg, &hr, ".")
+			return fn(ctx, cl, cfg, &hr, ".")
 		},
 	}
 	cmd.ValidArgsFunction = completeHelmReleases
@@ -457,13 +620,13 @@ func cmdFactory(name string, fn runFn) *cobra.Command {
 
 // cmdShow returns the `cozypkg show` command.
 func cmdShow() *cobra.Command {
-	cmd := cmdFactory("show", func(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
+	cmd := cmdFactory("show", func(ctx context.Context, cl client.Client, cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
 		var vals map[string]interface{}
 		if plain {
 			vals = map[string]interface{}{}
 		} else {
 			var err error
-			vals, err = mergedValues(hr, chartDir)
+			vals, err = mergedValues(ctx, cl, hr, chartDir)
 			if err != nil {
 				return err
 			}
@@ -527,16 +690,9 @@ func cmdShow() *cobra.Command {
 func cmdApply() *cobra.Command {
 	var autoResume bool
 	var takeOwnership bool
-	cmd := cmdFactory("apply", func(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
+	cmd := cmdFactory("apply", func(ctx context.Context, cl client.Client, cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
 		if plain && autoResume {
 			return fmt.Errorf("--resume may not be used with --plain")
-		}
-		ctx := context.Background()
-
-		rc := restConfig()
-		cl, err := client.New(rc, client.Options{})
-		if err != nil {
-			return fmt.Errorf("could not create Kubernetes client: %w", err)
 		}
 
 		bc := record.NewBroadcaster()
@@ -552,7 +708,7 @@ func cmdApply() *cobra.Command {
 			fmt.Fprintf(os.Stderr, "HelmRelease %s/%s suspended\n", hr.Namespace, hr.Name)
 			// Merge values from the HelmRelease.
 			var err error
-			vals, err = mergedValues(hr, chartDir)
+			vals, err = mergedValues(ctx, cl, hr, chartDir)
 			if err != nil {
 				return err
 			}
@@ -567,8 +723,9 @@ func cmdApply() *cobra.Command {
 		var chartVer, cfgDigest string
 		if !plain {
 			cfgDigest = fluxchartutil.DigestValues(digest.Canonical, vals).String()
-			if hr.Spec.Chart != nil {
-				chartVer = hr.Spec.Chart.Spec.Version
+			_, ver, err := getChartInfo(ctx, cl, hr)
+			if err == nil {
+				chartVer = ver
 			}
 
 			hr.Status.LastAttemptedGeneration = hr.Generation
@@ -605,13 +762,13 @@ func cmdApply() *cobra.Command {
 
 // cmdDiff returns the `cozypkg diff` command.
 func cmdDiff() *cobra.Command {
-	cmd := cmdFactory("diff", func(cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
+	cmd := cmdFactory("diff", func(ctx context.Context, cl client.Client, cfg *helmaction.Configuration, hr *v2.HelmRelease, chartDir string) error {
 		var vals map[string]interface{}
 		if plain {
 			vals = map[string]interface{}{}
 		} else {
 			var err error
-			vals, err = mergedValues(hr, chartDir)
+			vals, err = mergedValues(ctx, cl, hr, chartDir)
 			if err != nil {
 				return err
 			}
@@ -639,13 +796,8 @@ func cmdDiff() *cobra.Command {
 
 // cmdSuspend returns the `cozypkg suspend` command.
 func cmdSuspend() *cobra.Command {
-	cmd := cmdFactory("suspend", func(_ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
-		rc := restConfig()
-		cl, err := client.New(rc, client.Options{})
-		if err != nil {
-			return fmt.Errorf("could not create Kubernetes client: %w", err)
-		}
-		return patchSuspend(context.Background(), cl, hr.Namespace, hr.Name, pointer.Bool(true))
+	cmd := cmdFactory("suspend", func(ctx context.Context, cl client.Client, _ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
+		return patchSuspend(ctx, cl, hr.Namespace, hr.Name, pointer.Bool(true))
 	})
 	cmd.Short = "Suspend Flux HelmRelease"
 	return cmd
@@ -653,13 +805,8 @@ func cmdSuspend() *cobra.Command {
 
 // cmdResume returns the `cozypkg resume` command.
 func cmdResume() *cobra.Command {
-	cmd := cmdFactory("resume", func(_ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
-		rc := restConfig()
-		cl, err := client.New(rc, client.Options{})
-		if err != nil {
-			return fmt.Errorf("could not create Kubernetes client: %w", err)
-		}
-		return patchSuspend(context.Background(), cl, hr.Namespace, hr.Name, nil)
+	cmd := cmdFactory("resume", func(ctx context.Context, cl client.Client, _ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
+		return patchSuspend(ctx, cl, hr.Namespace, hr.Name, nil)
 	})
 	cmd.Short = "Resume Flux HelmRelease"
 	return cmd
@@ -667,7 +814,7 @@ func cmdResume() *cobra.Command {
 
 // cmdDelete returns the `cozypkg delete` command.
 func cmdDelete() *cobra.Command {
-	cmd := cmdFactory("delete", func(cfg *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
+	cmd := cmdFactory("delete", func(_ context.Context, _ client.Client, cfg *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
 		un := helmaction.NewUninstall(cfg)
 		_, err := un.Run(hr.Name)
 		return err
@@ -944,10 +1091,12 @@ func cmdList() *cobra.Command {
 }
 
 // newHistoryEntry creates a v2.Snapshot for status.history.
-func newHistoryEntry(hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Snapshot {
-	chartName := ""
-	if hr.Spec.Chart != nil {
-		chartName = hr.Spec.Chart.Spec.Chart
+func newHistoryEntry(ctx context.Context, cl client.Client, hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Snapshot {
+	chartName, _, err := getChartInfo(ctx, cl, hr)
+	if err != nil {
+		// Log the error and fall back to the HelmRelease name.
+		log.Printf("could not get chart info for %s/%s: %v", hr.Namespace, hr.Name, err)
+		chartName = hr.Name
 	}
 	return &v2.Snapshot{
 		Name:          chartName,
@@ -964,16 +1113,18 @@ func newHistoryEntry(hr *v2.HelmRelease, chartVersion, cfgDigest string) *v2.Sna
 
 // markSuccess sets Ready=True and emits a normal event.
 func markSuccess(ctx context.Context, cl client.Client, rec record.EventRecorder, hr *v2.HelmRelease, chartVer, cfgDigest string) {
-	chartName := ""
-	if hr.Spec.Chart != nil {
-		chartName = hr.Spec.Chart.Spec.Chart
+	chartName, _, err := getChartInfo(ctx, cl, hr)
+	if err != nil {
+		// Log the error and fall back to the HelmRelease name for the message.
+		log.Printf("could not get chart info for %s/%s: %v", hr.Namespace, hr.Name, err)
+		chartName = hr.Name
 	}
 	msg := fmt.Sprintf("Helm upgrade succeeded for %s/%s with chart %s@%s", hr.Namespace, hr.Name, chartName, chartVer)
 
 	conditions.MarkTrue(hr, v2.ReleasedCondition, v2.UpgradeSucceededReason, msg)
 	conditions.MarkTrue(hr, fluxmeta.ReadyCondition, v2.UpgradeSucceededReason, msg)
 
-	hr.Status.History = append(hr.Status.History, newHistoryEntry(hr, chartVer, cfgDigest))
+	hr.Status.History = append(hr.Status.History, newHistoryEntry(ctx, cl, hr, chartVer, cfgDigest))
 	hr.Status.Failures = 0
 	hr.Status.ObservedGeneration = hr.Generation
 	_ = cl.Status().Update(ctx, hr)
@@ -1103,12 +1254,8 @@ func completeNamespaces(cmd *cobra.Command, args []string, toComplete string) ([
 }
 
 func completeHelmReleases(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	var err error
 	rc := restConfig()
 
-	if err != nil {
-		return nil, cobra.ShellCompDirectiveError
-	}
 	cl, err := client.New(rc, client.Options{})
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
@@ -1143,9 +1290,14 @@ func cmdReconcile() *cobra.Command {
 		force      bool
 	)
 
-	cmd := cmdFactory("reconcile", func(_ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	cmd := cmdFactory("reconcile", func(ctx context.Context, cl client.Client, _ *helmaction.Configuration, hr *v2.HelmRelease, _ string) error {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
+
+		// Check if HelmRelease is suspended
+		if hr.Spec.Suspend {
+			return fmt.Errorf("resource is suspended")
+		}
 
 		// ------------------------------------------------------------------ //
 		// Clients & helpers                                                  //
@@ -1153,10 +1305,6 @@ func cmdReconcile() *cobra.Command {
 		var err error
 		rc := restConfig()
 
-		cl, err := client.New(rc, client.Options{})
-		if err != nil {
-			return err
-		}
 		dyn, err := dynamic.NewForConfig(rc)
 		if err != nil {
 			return err
@@ -1201,49 +1349,173 @@ func cmdReconcile() *cobra.Command {
 		}
 
 		// ------------------------------------------------------------------ //
-		// 1. (optional) HelmChart                                            //
+		// 1. (optional) Source resource (HelmChart, ExternalArtifact, etc.) //
 		// ------------------------------------------------------------------ //
 		if withSource {
-			if hr.Spec.Chart == nil {
-				return fmt.Errorf("HelmRelease %s/%s has no chart spec", hr.Namespace, hr.Name)
-			}
-			chartNS := hr.Spec.Chart.Spec.SourceRef.Namespace
-			if chartNS == "" {
-				chartNS = hr.Namespace
-			}
-			chartName := fmt.Sprintf("%s-%s", hr.Namespace, hr.Name)
-			chartGVR := schema.GroupVersionResource{
-				Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts",
+			var sourceGVR schema.GroupVersionResource
+			var sourceNS, sourceName string
+			var sourceReconciliationDone bool
+
+			if hr.Spec.ChartRef != nil {
+				// Reconcile the referenced source
+				refNS := hr.Spec.ChartRef.Namespace
+				if refNS == "" {
+					refNS = hr.Namespace
+				}
+				refName := hr.Spec.ChartRef.Name
+				sourceNS = refNS
+				sourceName = refName
+
+				switch hr.Spec.ChartRef.Kind {
+				case "HelmChart":
+					sourceGVR = schema.GroupVersionResource{
+						Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts",
+					}
+				case "ExternalArtifact":
+					// For ExternalArtifact, we need to find its source (GitRepository, OCIRepository, etc.)
+					// through the ArtifactGenerator that created it
+					artifactGen, err := findArtifactGeneratorForExternalArtifact(ctx, cl, refNS, refName)
+					if err != nil {
+						return fmt.Errorf("failed to find ArtifactGenerator for ExternalArtifact %s/%s: %w", refNS, refName, err)
+					}
+
+					// Found ArtifactGenerator, now find and reconcile its sources
+					sources, found, _ := unstructured.NestedSlice(artifactGen.Object, "spec", "sources")
+					if !found || len(sources) == 0 {
+						return fmt.Errorf("ArtifactGenerator %s has no sources", artifactGen.GetName())
+					}
+
+					// Reconcile all sources
+					for _, src := range sources {
+						srcMap, ok := src.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						kind, _, _ := unstructured.NestedString(srcMap, "kind")
+						name, _, _ := unstructured.NestedString(srcMap, "name")
+						srcNS, _, _ := unstructured.NestedString(srcMap, "namespace")
+						if srcNS == "" {
+							srcNS = refNS
+						}
+
+						// Determine GVR based on source kind
+						var srcGVR schema.GroupVersionResource
+						switch kind {
+						case "GitRepository":
+							srcGVR = schema.GroupVersionResource{
+								Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "gitrepositories",
+							}
+						case "OCIRepository":
+							srcGVR = schema.GroupVersionResource{
+								Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories",
+							}
+						case "Bucket":
+							srcGVR = schema.GroupVersionResource{
+								Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "buckets",
+							}
+						default:
+							continue
+						}
+
+						// Annotate and reconcile the source
+						source := &unstructured.Unstructured{}
+						source.SetGroupVersionKind(schema.GroupVersionKind{
+							Group:   srcGVR.Group,
+							Version: srcGVR.Version,
+							Kind:    kind,
+						})
+						if err := cl.Get(ctx, types.NamespacedName{Namespace: srcNS, Name: name}, source); err != nil {
+							return fmt.Errorf("%s %s/%s not found: %w", kind, srcNS, name, err)
+						}
+						// Check if source is suspended
+						if suspended, found, _ := unstructured.NestedBool(source.Object, "spec", "suspend"); found && suspended {
+							return fmt.Errorf("resource is suspended")
+						}
+						ts := time.Now().Format(time.RFC3339Nano)
+						patch := client.MergeFrom(source.DeepCopy())
+						ann := source.GetAnnotations()
+						if ann == nil {
+							ann = map[string]string{}
+						}
+						ann["reconcile.fluxcd.io/requestedAt"] = ts
+						source.SetAnnotations(ann)
+						if err := cl.Patch(ctx, source, patch); err != nil {
+							return fmt.Errorf("patch %s: %w", kind, err)
+						}
+						fmt.Fprintf(os.Stderr, "✔ %s %s/%s annotated\n", kind, srcNS, name)
+
+						fmt.Fprintf(os.Stderr, "◎ waiting for %s %s/%s reconciliation\n", kind, srcNS, name)
+						if err := waitByWatch(srcGVR, srcNS, name, "lastHandledReconcileAt", ts); err != nil {
+							return err
+						}
+						fmt.Fprintf(os.Stderr, "✔ %s %s/%s reconciled\n", kind, srcNS, name)
+					}
+					// After sources are reconciled, we're done with ExternalArtifact
+					// Skip the rest of the source reconciliation logic for ExternalArtifact
+					sourceReconciliationDone = true
+				case "OCIRepository":
+					sourceGVR = schema.GroupVersionResource{
+						Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "ocirepositories",
+					}
+				default:
+					return fmt.Errorf("unsupported chartRef kind for reconciliation: %s", hr.Spec.ChartRef.Kind)
+				}
+			} else if hr.Spec.Chart != nil {
+				// Reconcile the generated HelmChart
+				chartNS := hr.Spec.Chart.Spec.SourceRef.Namespace
+				if chartNS == "" {
+					chartNS = hr.Namespace
+				}
+				sourceNS = chartNS
+				sourceName = fmt.Sprintf("%s-%s", hr.Namespace, hr.Name)
+				sourceGVR = schema.GroupVersionResource{
+					Group: "source.toolkit.fluxcd.io", Version: "v1", Resource: "helmcharts",
+				}
+			} else {
+				return fmt.Errorf("HelmRelease %s/%s has neither chart nor chartRef", hr.Namespace, hr.Name)
 			}
 
-			// annotate
-			chart := &unstructured.Unstructured{}
-			chart.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "source.toolkit.fluxcd.io",
-				Version: "v1",
-				Kind:    "HelmChart",
-			})
-			if err := cl.Get(ctx, types.NamespacedName{Namespace: chartNS, Name: chartName}, chart); err != nil {
-				return fmt.Errorf("HelmChart %s/%s not found: %w", chartNS, chartName, err)
-			}
-			ts := time.Now().Format(time.RFC3339Nano)
-			patch := client.MergeFrom(chart.DeepCopy())
-			ann := chart.GetAnnotations()
-			if ann == nil {
-				ann = map[string]string{}
-			}
-			ann["reconcile.fluxcd.io/requestedAt"] = ts
-			chart.SetAnnotations(ann)
-			if err := cl.Patch(ctx, chart, patch); err != nil {
-				return fmt.Errorf("patch HelmChart: %w", err)
-			}
-			fmt.Fprintf(os.Stderr, "✔ HelmChart %s annotated\n", chartName)
+			// Skip annotation if we already handled ExternalArtifact sources above
+			if !sourceReconciliationDone {
+				// Annotate the source resource
+				source := &unstructured.Unstructured{}
+				var kind string
+				if hr.Spec.ChartRef != nil {
+					kind = hr.Spec.ChartRef.Kind
+				} else {
+					kind = "HelmChart"
+				}
+				source.SetGroupVersionKind(schema.GroupVersionKind{
+					Group:   sourceGVR.Group,
+					Version: sourceGVR.Version,
+					Kind:    kind,
+				})
+				if err := cl.Get(ctx, types.NamespacedName{Namespace: sourceNS, Name: sourceName}, source); err != nil {
+					return fmt.Errorf("%s %s/%s not found: %w", source.GetKind(), sourceNS, sourceName, err)
+				}
+				// Check if source is suspended
+				if suspended, found, _ := unstructured.NestedBool(source.Object, "spec", "suspend"); found && suspended {
+					return fmt.Errorf("resource is suspended")
+				}
+				ts := time.Now().Format(time.RFC3339Nano)
+				patch := client.MergeFrom(source.DeepCopy())
+				ann := source.GetAnnotations()
+				if ann == nil {
+					ann = map[string]string{}
+				}
+				ann["reconcile.fluxcd.io/requestedAt"] = ts
+				source.SetAnnotations(ann)
+				if err := cl.Patch(ctx, source, patch); err != nil {
+					return fmt.Errorf("patch %s: %w", source.GetKind(), err)
+				}
+				fmt.Fprintf(os.Stderr, "✔ %s %s annotated\n", source.GetKind(), sourceName)
 
-			fmt.Fprintln(os.Stderr, "◎ waiting for HelmChart reconciliation")
-			if err := waitByWatch(chartGVR, chartNS, chartName, "lastHandledReconcileAt", ts); err != nil {
-				return err
+				fmt.Fprintf(os.Stderr, "◎ waiting for %s reconciliation\n", source.GetKind())
+				if err := waitByWatch(sourceGVR, sourceNS, sourceName, "lastHandledReconcileAt", ts); err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "✔ %s reconciled\n", source.GetKind())
 			}
-			fmt.Fprintln(os.Stderr, "✔ HelmChart reconciled")
 		}
 
 		// ------------------------------------------------------------------ //
